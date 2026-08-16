@@ -1,8 +1,8 @@
-name: dbt CI
+name: dbt CI/CD
 
-# This workflow runs automatically on every push or pull request
-# targeting the main branch, validating that dbt models and tests
-# still pass before the change is considered safe to merge.
+# CI runs on every push or pull request, validating the code against
+# the dev environment. CD runs only after CI succeeds AND only on
+# pushes to main -- deploying the validated change to production.
 on:
   push:
     branches: [main]
@@ -10,53 +10,96 @@ on:
     branches: [main]
 
 jobs:
-  dbt-test:
+  # ---------------------------------------------------------------
+  # CI: validates the change against dev. Runs on every push and PR.
+  # ---------------------------------------------------------------
+  ci-dev:
     runs-on: ubuntu-latest
-    # All dbt commands run from inside the dbt project folder.
     defaults:
       run:
         working-directory: snowflake_dbt_medallion
 
     steps:
-      # Checks out the repository code onto the CI runner.
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # Installs Python, required to run dbt.
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      # Installs dbt-core and the Snowflake adapter, matching the
-      # versions used locally.
       - name: Install dbt
         run: pip install dbt-core==1.12.2 dbt-snowflake==1.12.0
 
-      # Installs dbt package dependencies (dbt_utils, dbt_expectations).
       - name: Install dbt packages
         run: dbt deps
 
-      # Verifies the profile can connect to Snowflake using the
-      # password stored as a GitHub Actions secret -- never hardcoded.
       - name: dbt debug
         env:
           DBT_SNOWFLAKE_PASSWORD: ${{ secrets.DBT_SNOWFLAKE_PASSWORD }}
           DBT_PROFILES_DIR: .
         run: dbt debug
 
-      # Builds all models against the dev target, so CI validates the
-      # actual SQL logic without touching production data.
       - name: dbt run (dev)
         env:
           DBT_SNOWFLAKE_PASSWORD: ${{ secrets.DBT_SNOWFLAKE_PASSWORD }}
           DBT_PROFILES_DIR: .
         run: dbt run --target dev
 
-      # Runs all data tests -- this is the main safety check: if any
-      # test fails, the workflow fails and blocks the change.
       - name: dbt test (dev)
         env:
           DBT_SNOWFLAKE_PASSWORD: ${{ secrets.DBT_SNOWFLAKE_PASSWORD }}
           DBT_PROFILES_DIR: .
         run: dbt test --target dev
+
+      - name: dbt snapshot (dev)
+        env:
+          DBT_SNOWFLAKE_PASSWORD: ${{ secrets.DBT_SNOWFLAKE_PASSWORD }}
+          DBT_PROFILES_DIR: .
+        run: dbt snapshot --target dev
+
+  # ---------------------------------------------------------------
+  # CD: deploys to production. Only runs if ci-dev succeeded, and
+  # only on a direct push to main (e.g. after a PR merge) -- never
+  # on a pull_request event, to avoid deploying unmerged code.
+  # ---------------------------------------------------------------
+  cd-prod:
+    needs: ci-dev
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: snowflake_dbt_medallion
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dbt
+        run: pip install dbt-core==1.12.2 dbt-snowflake==1.12.0
+
+      - name: Install dbt packages
+        run: dbt deps
+
+      - name: dbt run (prod)
+        env:
+          DBT_SNOWFLAKE_PASSWORD: ${{ secrets.DBT_SNOWFLAKE_PASSWORD }}
+          DBT_PROFILES_DIR: .
+        run: dbt run --target prod
+
+      - name: dbt test (prod)
+        env:
+          DBT_SNOWFLAKE_PASSWORD: ${{ secrets.DBT_SNOWFLAKE_PASSWORD }}
+          DBT_PROFILES_DIR: .
+        run: dbt test --target prod
+
+      - name: dbt snapshot (prod)
+        env:
+          DBT_SNOWFLAKE_PASSWORD: ${{ secrets.DBT_SNOWFLAKE_PASSWORD }}
+          DBT_PROFILES_DIR: .
+        run: dbt snapshot --target prod
