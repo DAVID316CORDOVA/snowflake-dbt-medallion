@@ -8,6 +8,11 @@ Simula llegadas diarias para practicar Snowpipe / carga incremental.
 Incluye columna VARIANT (atributos_extra) con JSON de forma variable,
 para practicar schema evolution en datos semi-estructurados y LATERAL FLATTEN.
 
+IDs generados con SEQUENCE.NEXTVAL (no MAX(id)+1) para evitar condiciones
+de carrera cuando multiples procesos (Airflow, CI/CD, corridas manuales)
+insertan datos de forma concurrente -- SEQUENCE es atomica a nivel de
+motor de base de datos, MAX(id)+1 calculado en el cliente no lo es.
+
 Uso: python scripts/generate_dirty_data_snowflake.py
 """
 
@@ -73,6 +78,16 @@ def rnd_atributos() -> dict:
     return {k: random.choice(pool[k]) for k in keys}
 
 
+def next_ids(cursor, sequence_name: str, n: int) -> list:
+    """Pide N valores atomicos de una SEQUENCE de Snowflake de una sola vez.
+    Esto reemplaza el patron MAX(id)+1, que sufre condiciones de carrera
+    cuando varios procesos insertan al mismo tiempo (Airflow, CI/CD, manual)."""
+    cursor.execute(
+        f"SELECT {sequence_name}.NEXTVAL FROM TABLE(GENERATOR(ROWCOUNT => {n}))"
+    )
+    return [row[0] for row in cursor.fetchall()]
+
+
 # ── SETUP ──────────────────────────────────────────────────────────────────────
 def setup(cursor):
     cursor.execute("""
@@ -100,52 +115,58 @@ def setup(cursor):
             _inserted_at     TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
         )
     """)
-    print("Tablas clientes y pedidos listas en RAW.")
+    # SEQUENCEs: generan IDs unicos de forma atomica, seguras ante
+    # insercion concurrente desde multiples procesos.
+    cursor.execute("""
+        CREATE SEQUENCE IF NOT EXISTS seq_clientes_id START = 20000 INCREMENT = 1
+    """)
+    cursor.execute("""
+        CREATE SEQUENCE IF NOT EXISTS seq_pedidos_id START = 300000 INCREMENT = 1
+    """)
+    print("Tablas clientes y pedidos listas en RAW (con SEQUENCEs para IDs).")
 
 
 # ── GENERADOR CLIENTES ─────────────────────────────────────────────────────────
 def gen_clientes(cursor, batch_id: int):
-    cursor.execute("SELECT COALESCE(MAX(id), 0) FROM clientes")
-    nxt = cursor.fetchone()[0] + 1
-
     REG_INI, REG_FIN, HOY = date(2022, 1, 1), date(2025, 6, 30), date.today()
     rows, stats = [], {}
 
-    clean_ids, clean_emails = [], []
     n_clean = round(N_CLIENTES * 0.80)
+    total_filas = n_clean + 2 + 2 + 1 + 1 + 1
+    ids = next_ids(cursor, 'seq_clientes_id', total_filas)
+    id_iter = iter(ids)
+
+    clean_ids, clean_emails = [], []
     for _ in range(n_clean):
         nom = random.choice(NOMBRES) + f" {random.randint(100, 9999)}"
         email = rnd_email(nom)
-        rows.append((nxt, nom, email, random.choice(CIUDADES), rnd_date(REG_INI, REG_FIN), batch_id))
-        clean_ids.append(nxt); clean_emails.append(email); nxt += 1
+        cid = next(id_iter)
+        rows.append((cid, nom, email, random.choice(CIUDADES), rnd_date(REG_INI, REG_FIN), batch_id))
+        clean_ids.append(cid); clean_emails.append(email)
     stats['limpios'] = n_clean
 
     for _ in range(2):
         nom = random.choice(NOMBRES) + f" {random.randint(100, 9999)}"
-        rows.append((nxt, nom, None, random.choice(CIUDADES), rnd_date(REG_INI, REG_FIN), batch_id))
-        nxt += 1
+        rows.append((next(id_iter), nom, None, random.choice(CIUDADES), rnd_date(REG_INI, REG_FIN), batch_id))
     stats['email_null'] = 2
 
-    dup_sources = random.sample(clean_ids, min(2, len(clean_ids)))
-    for did in dup_sources:
-        rows.append(next(r for r in rows if r[0] == did))
+    dup_sources = random.sample(rows[:n_clean], min(2, n_clean))
+    for src in dup_sources:
+        rows.append((next(id_iter),) + src[1:])
     stats['duplicados_exactos'] = len(dup_sources)
 
     email_dup = random.choice(clean_emails)
     nom2 = random.choice(NOMBRES) + f" {random.randint(100, 9999)}"
-    rows.append((nxt, nom2, email_dup, random.choice(CIUDADES), rnd_date(REG_INI, REG_FIN), batch_id))
-    nxt += 1
+    rows.append((next(id_iter), nom2, email_dup, random.choice(CIUDADES), rnd_date(REG_INI, REG_FIN), batch_id))
     stats['duplicado_negocio_email'] = 1
 
-    rows.append((nxt, "  " + random.choice(NOMBRES).upper() + "  ", "usuariosinarroba.com",
+    rows.append((next(id_iter), "  " + random.choice(NOMBRES).upper() + "  ", "usuariosinarroba.com",
                  "  " + random.choice(CIUDADES), rnd_date(REG_INI, REG_FIN), batch_id))
-    nxt += 1
     stats['formato_nombre_email'] = 1
 
     fechas_malas = ['1800-03-15', (HOY + timedelta(days=500)).isoformat(), '99/99/9999']
-    rows.append((nxt, random.choice(NOMBRES) + f" {random.randint(100, 9999)}",
+    rows.append((next(id_iter), random.choice(NOMBRES) + f" {random.randint(100, 9999)}",
                  rnd_email("test user"), random.choice(CIUDADES), random.choice(fechas_malas), batch_id))
-    nxt += 1
     stats['fecha_invalida'] = 1
 
     stats['total_filas'] = len(rows)
@@ -154,74 +175,69 @@ def gen_clientes(cursor, batch_id: int):
 
 # ── GENERADOR PEDIDOS ──────────────────────────────────────────────────────────
 def gen_pedidos(cursor, batch_id: int, valid_cids: list):
-    cursor.execute("SELECT COALESCE(MAX(id), 0) FROM pedidos")
-    nxt = cursor.fetchone()[0] + 1
-
     REG_INI, REG_FIN, HOY = date(2022, 1, 1), date(2025, 6, 30), date.today()
     rows, stats = [], {}
 
-    n_clean, clean_ids = round(N_PEDIDOS * 0.78), []
+    n_clean = round(N_PEDIDOS * 0.78)
+    total_filas = n_clean + 3 + 2 + 2 + 2 + 2 + 2 + 3
+    ids = next_ids(cursor, 'seq_pedidos_id', total_filas)
+    id_iter = iter(ids)
+
+    clean_ids = []
     for _ in range(n_clean):
-        rows.append((nxt, random.choice(valid_cids), random.choice(PRODUCTOS),
+        pid = next(id_iter)
+        rows.append((pid, random.choice(valid_cids), random.choice(PRODUCTOS),
                      str(random.randint(1, 20)), str(round(random.uniform(10.0, 2000.0), 2)),
                      rnd_date(REG_INI, REG_FIN), random.choice(ESTADOS), batch_id))
-        clean_ids.append(nxt); nxt += 1
+        clean_ids.append(pid)
     stats['limpios'] = n_clean
 
     for _ in range(3):
-        rows.append((nxt, random.choice(valid_cids), random.choice(PRODUCTOS),
+        rows.append((next(id_iter), random.choice(valid_cids), random.choice(PRODUCTOS),
                      str(random.randint(1, 10)), None, rnd_date(REG_INI, REG_FIN),
                      random.choice(ESTADOS), batch_id))
-        nxt += 1
     stats['precio_null'] = 3
 
     for _ in range(2):
         fake_cid = random.randint(99000, 99999)
-        rows.append((nxt, fake_cid, random.choice(PRODUCTOS), str(random.randint(1, 5)),
+        rows.append((next(id_iter), fake_cid, random.choice(PRODUCTOS), str(random.randint(1, 5)),
                      str(round(random.uniform(10.0, 500.0), 2)), rnd_date(REG_INI, REG_FIN),
                      random.choice(ESTADOS), batch_id))
-        nxt += 1
     stats['fk_huerfana'] = 2
 
-    dup_pids = random.sample(clean_ids, min(2, len(clean_ids)))
-    for dp in dup_pids:
-        rows.append(next(r for r in rows if r[0] == dp))
-    stats['duplicados_exactos'] = len(dup_pids)
+    dup_sources = random.sample(rows[:n_clean], min(2, n_clean))
+    for src in dup_sources:
+        rows.append((next(id_iter),) + src[1:])
+    stats['duplicados_exactos'] = len(dup_sources)
 
     for _ in range(2):
         fecha_fut = (HOY + timedelta(days=random.randint(30, 730))).isoformat()
-        rows.append((nxt, random.choice(valid_cids), random.choice(PRODUCTOS),
+        rows.append((next(id_iter), random.choice(valid_cids), random.choice(PRODUCTOS),
                      str(random.randint(1, 10)), str(round(random.uniform(10.0, 500.0), 2)),
                      fecha_fut, random.choice(ESTADOS), batch_id))
-        nxt += 1
     stats['fecha_futura'] = 2
 
     fechas_raras = ['15/03/2024', '2024.07.22', 'marzo 2024', '32/13/2023']
     for _ in range(2):
-        rows.append((nxt, random.choice(valid_cids), "  " + random.choice(PRODUCTOS).lower() + "  ",
+        rows.append((next(id_iter), random.choice(valid_cids), "  " + random.choice(PRODUCTOS).lower() + "  ",
                      str(random.randint(1, 5)), str(round(random.uniform(10.0, 200.0), 2)),
                      random.choice(fechas_raras), random.choice(ESTADOS), batch_id))
-        nxt += 1
     stats['fecha_formato_raro'] = 2
 
     for _ in range(2):
-        rows.append((nxt, random.choice(valid_cids), random.choice(PRODUCTOS),
+        rows.append((next(id_iter), random.choice(valid_cids), random.choice(PRODUCTOS),
                      str(random.choice([0, -1, -3])), str(round(random.uniform(-500.0, 0), 2)),
                      rnd_date(REG_INI, REG_FIN), random.choice(ESTADOS), batch_id))
-        nxt += 1
     stats['numericos_invalidos'] = 2
 
     textos_corruptos = ['N/A', '#ERROR!', 'null_val', 'ABCD$$', '???']
     for _ in range(3):
-        rows.append((nxt, random.choice(valid_cids), random.choice(PRODUCTOS),
+        rows.append((next(id_iter), random.choice(valid_cids), random.choice(PRODUCTOS),
                      random.choice(textos_corruptos), str(round(random.uniform(10.0, 500.0), 2)),
                      rnd_date(REG_INI, REG_FIN), random.choice(ESTADOS), batch_id))
-        nxt += 1
     stats['texto_corrupto_cantidad'] = 3
 
     stats['total_filas'] = len(rows)
-
-    # Agrega el JSON de atributos_extra (2 a 4 llaves variables) a cada fila
     rows = [r + (json.dumps(rnd_atributos()),) for r in rows]
 
     return rows, stats
@@ -238,7 +254,6 @@ def main():
     batch_id = cursor.fetchone()[0]
     print(f"\nGenerando LOTE #{batch_id}...")
 
-    # ── Clientes ───────────────────────────────────────────────────────────────
     c_rows, c_stats, new_valid_cids = gen_clientes(cursor, batch_id)
     cursor.executemany(
         "INSERT INTO clientes (id, nombre, email, ciudad, fecha_registro, _batch_id) "
@@ -249,7 +264,6 @@ def main():
     cursor.execute("SELECT DISTINCT id FROM clientes WHERE id IS NOT NULL")
     all_valid_cids = [r[0] for r in cursor.fetchall()] or new_valid_cids
 
-    # ── Pedidos (incluye atributos_extra como JSON via PARSE_JSON) ──────────────
     p_rows, p_stats = gen_pedidos(cursor, batch_id, all_valid_cids)
     cursor.executemany(
         "INSERT INTO pedidos "
@@ -288,6 +302,7 @@ def main():
   Texto corrupto en cantidad        : {p_stats['texto_corrupto_cantidad']}
   atributos_extra (VARIANT, 2-4 keys variables) en TODAS las filas
 =================================================================
+  IDs generados con SEQUENCE.NEXTVAL (seguro ante concurrencia)
   Ejecuta de nuevo para agregar el LOTE #{batch_id + 1}
 =================================================================
 """)
