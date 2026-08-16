@@ -1,0 +1,9 @@
+version: 2
+
+sources:
+  - name: raw_layer
+    database: SNOWFLAKE_MEDALLION
+    schema: RAW
+    tables:
+      - name: clientes
+      - name: pedidos

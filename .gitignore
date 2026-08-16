@@ -1,0 +1,12 @@
+venv/
+.env
+.env~
+target/
+logs/
+*.csv
+dbt_packages/
+__pycache__/
+.terraform/
+*.tfstate
+*.tfstate.backup
+.terraform.lock.hcl

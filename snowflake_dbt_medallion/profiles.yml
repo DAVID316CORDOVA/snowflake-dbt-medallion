@@ -1,0 +1,23 @@
+snowflake_dbt_medallion:
+  outputs:
+    dev:
+      account: bic01670.us-east-1
+      database: SNOWFLAKE_MEDALLION
+      password: '{{ env_var(''DBT_SNOWFLAKE_PASSWORD'') }}'
+      role: ACCOUNTADMIN
+      schema: BRONZE
+      threads: 1
+      type: snowflake
+      user: david
+      warehouse: COMPUTE_WH
+    prod:
+      account: bic01670.us-east-1
+      database: SNOWFLAKE_MEDALLION_PROD
+      password: '{{ env_var(''DBT_SNOWFLAKE_PASSWORD'') }}'
+      role: ACCOUNTADMIN
+      schema: BRONZE
+      threads: 4
+      type: snowflake
+      user: david
+      warehouse: COMPUTE_WH
+  target: dev

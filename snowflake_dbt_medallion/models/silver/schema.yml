@@ -1,0 +1,31 @@
+version: 2
+
+models:
+  - name: stg_clientes
+    columns:
+      - name: cliente_id
+        tests:
+          - not_null
+      - name: email
+        tests:
+          - not_null
+          - dbt_expectations.expect_column_values_to_match_regex:
+              regex: '^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$'
+      - name: fecha_registro
+        tests:
+          - dbt_expectations.expect_column_values_to_be_between:
+              min_value: "'2020-01-01'"
+              max_value: "current_date()"
+
+  - name: stg_pedidos
+    columns:
+      - name: pedido_id
+        tests:
+          - not_null
+      - name: cliente_id
+        tests:
+          - relationships:
+              to: ref('stg_clientes')
+              field: cliente_id
+              config:
+                severity: warn
