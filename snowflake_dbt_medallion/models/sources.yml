@@ -2,7 +2,7 @@ version: 2
 
 sources:
   - name: raw_layer
-    database: SNOWFLAKE_MEDALLION
+    database:  "{{ 'SNOWFLAKE_MEDALLION_PROD' if target.name == 'prod' else 'SNOWFLAKE_MEDALLION' }}"
     schema: RAW
     tables:
       - name: clientes
