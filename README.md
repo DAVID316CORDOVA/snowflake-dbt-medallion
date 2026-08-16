@@ -144,6 +144,57 @@ mart for reporting).
 
 ---
 
+## Fixing a real concurrency bug: SEQUENCE vs MAX(id)+1
+
+The original data-seeding script computed the next ID like this:
+
+```python
+cursor.execute("SELECT COALESCE(MAX(id), 0) FROM clientes")
+nxt = cursor.fetchone()[0] + 1
+```
+
+This works fine when only one process writes at a time. It broke the moment
+multiple processes started writing concurrently — Airflow's scheduled DAG,
+the CI/CD pipeline, and manual runs all triggering the seed script around
+the same time. Two processes could read the same `MAX(id)` before either
+had finished inserting, both computing the same "next" ID — a classic
+**race condition**, surfaced downstream as thousands of duplicate primary
+keys and failing `unique` tests on `dim_clientes` and `fct_pedidos`, and as
+a `MERGE` failure on the incremental model ("Duplicate row detected").
+
+**Fix:** replaced client-computed IDs with a native Snowflake `SEQUENCE`,
+which guarantees a unique value per call atomically at the database engine
+level, regardless of how many processes call it concurrently:
+
+```sql
+CREATE SEQUENCE IF NOT EXISTS seq_clientes_id START = 20000 INCREMENT = 1;
+```
+
+```python
+def next_ids(cursor, sequence_name: str, n: int) -> list:
+    """Requests N sequence values in a single atomic call, instead of
+    incrementing a client-side counter — safe under concurrent writers."""
+    cursor.execute(
+        f"SELECT {sequence_name}.NEXTVAL FROM TABLE(GENERATOR(ROWCOUNT => {n}))"
+    )
+    return [row[0] for row in cursor.fetchall()]
+```
+
+Existing duplicates were cleaned up with the same `QUALIFY` deduplication
+pattern used elsewhere in the project:
+
+```sql
+CREATE OR REPLACE TABLE clientes AS
+SELECT * FROM clientes
+QUALIFY ROW_NUMBER() OVER (PARTITION BY id ORDER BY _inserted_at DESC) = 1;
+```
+
+Verified with all 13 tests passing (`unique_dim_clientes_cliente_id` and
+`unique_fct_pedidos_pedido_id` included) after the fix, both locally and
+through CI/CD against dev and prod.
+
+---
+
 ## Incremental models
 
 `pedidos_incremental` demonstrates dbt's `incremental` materialization with
