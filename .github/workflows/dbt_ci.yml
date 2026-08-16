@@ -1,0 +1,62 @@
+name: dbt CI
+
+# This workflow runs automatically on every push or pull request
+# targeting the main branch, validating that dbt models and tests
+# still pass before the change is considered safe to merge.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  dbt-test:
+    runs-on: ubuntu-latest
+    # All dbt commands run from inside the dbt project folder.
+    defaults:
+      run:
+        working-directory: snowflake_dbt_medallion
+
+    steps:
+      # Checks out the repository code onto the CI runner.
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Installs Python, required to run dbt.
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # Installs dbt-core and the Snowflake adapter, matching the
+      # versions used locally.
+      - name: Install dbt
+        run: pip install dbt-core==1.12.2 dbt-snowflake==1.12.0
+
+      # Installs dbt package dependencies (dbt_utils, dbt_expectations).
+      - name: Install dbt packages
+        run: dbt deps
+
+      # Verifies the profile can connect to Snowflake using the
+      # password stored as a GitHub Actions secret -- never hardcoded.
+      - name: dbt debug
+        env:
+          DBT_SNOWFLAKE_PASSWORD: ${{ secrets.DBT_SNOWFLAKE_PASSWORD }}
+          DBT_PROFILES_DIR: .
+        run: dbt debug
+
+      # Builds all models against the dev target, so CI validates the
+      # actual SQL logic without touching production data.
+      - name: dbt run (dev)
+        env:
+          DBT_SNOWFLAKE_PASSWORD: ${{ secrets.DBT_SNOWFLAKE_PASSWORD }}
+          DBT_PROFILES_DIR: .
+        run: dbt run --target dev
+
+      # Runs all data tests -- this is the main safety check: if any
+      # test fails, the workflow fails and blocks the change.
+      - name: dbt test (dev)
+        env:
+          DBT_SNOWFLAKE_PASSWORD: ${{ secrets.DBT_SNOWFLAKE_PASSWORD }}
+          DBT_PROFILES_DIR: .
+        run: dbt test --target dev
